@@ -14,6 +14,7 @@ from ruhusa import (
     AuthorizationRequest,
     DecisionEffect,
     ExecutionController,
+    ExecutionRecoveryOutcome,
     InMemoryAuditLog,
     InMemoryExecutionStore,
     InMemoryInvocationStore,
@@ -42,6 +43,10 @@ class ReplayInput(BaseModel):
     account_id: str = Field(min_length=1)
     amount: float = Field(gt=0)
     principal_id: str = "billing-agent"
+
+class RecoveryInput(BaseModel):
+    outcome: str
+    reason: str = Field(min_length=1)
 
 @dataclass
 class Runtime:
@@ -527,4 +532,176 @@ def concurrency_execute(invocation_id: str, payload: RefundInput):
         "state": record.state.value if record else None,
         "attempt_count": record.attempt_count if record else None,
         "refund": side_effect,
+    }
+    
+@app.post("/failure/audit")
+def audit_failure_test():
+    class FailingAuditLog:
+        def append(self, request, decision):
+            raise RuntimeError("simulated audit backend outage")
+
+        def verify_chain(self):
+            return False
+
+    now = datetime.now(UTC)
+
+    invocation_store = InMemoryInvocationStore()
+    tool_registry = InMemoryToolRegistry()
+
+    tool_registry.register(
+        ToolRegistration(
+            tool_id=TOOL_ID,
+            implementation_id=IMPLEMENTATION_ID,
+            allowed_actions=frozenset({"refund"}),
+        )
+    )
+
+    invocation_id = f"inv-{uuid4().hex}"
+    task_id = f"task-{uuid4().hex}"
+
+    arguments = {"amount": 100.0}
+
+    invocation_store.register(
+        InvocationRecord(
+            invocation_id=invocation_id,
+            invoking_principal_id="fastapi-gateway",
+            executing_principal_id="billing-agent",
+            task_id=task_id,
+            action="refund",
+            resource="account/audit-failure",
+            arguments_digest=compute_arguments_digest(arguments),
+            tool_id=TOOL_ID,
+            implementation_id=IMPLEMENTATION_ID,
+            recorded_at=now,
+            expires_at=now + timedelta(minutes=5),
+        )
+    )
+
+    authorizer = Ruhusa(
+        policy_store=_policy_store(),
+        audit_log=FailingAuditLog(),
+        revocation_store=InMemoryRevocationStore(),
+        invocation_store=invocation_store,
+        tool_registry=tool_registry,
+    )
+
+    request = AuthorizationRequest(
+        principal=Principal(
+            principal_id="billing-agent",
+            principal_type="agent",
+        ),
+        action="refund",
+        resource="account/audit-failure",
+        arguments=arguments,
+        task=TaskContext(
+            task_id=task_id,
+            initiated_by="demo-user",
+            purpose="audit fail-closed smoke test",
+            expires_at=now + timedelta(minutes=10),
+        ),
+        invocation_id=invocation_id,
+    )
+
+    decision = authorizer.authorize(request, now=now)
+
+    return {
+        "policy_would_allow": True,
+        "final_effect": decision.effect.value,
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "side_effect_executed": False,
+    }
+    
+@app.post("/failure/claim-only")
+def create_abandoned_claim(payload: RefundInput):
+    now = datetime.now(UTC)
+
+    task_id = f"task-{uuid4().hex}"
+    invocation_id = f"inv-{uuid4().hex}"
+    resource = f"account/{payload.account_id}"
+    arguments = {"amount": payload.amount}
+
+    expires_at = now + timedelta(minutes=5)
+
+    runtime.invocation_store.register(
+        InvocationRecord(
+            invocation_id=invocation_id,
+            invoking_principal_id="fastapi-gateway",
+            executing_principal_id=payload.principal_id,
+            task_id=task_id,
+            action="refund",
+            resource=resource,
+            arguments_digest=compute_arguments_digest(arguments),
+            tool_id=TOOL_ID,
+            implementation_id=IMPLEMENTATION_ID,
+            recorded_at=now,
+            expires_at=expires_at,
+        )
+    )
+
+    request = AuthorizationRequest(
+        principal=Principal(
+            principal_id=payload.principal_id,
+            principal_type="agent",
+        ),
+        action="refund",
+        resource=resource,
+        arguments=arguments,
+        task=TaskContext(
+            task_id=task_id,
+            initiated_by="failure-test",
+            purpose="abandoned execution test",
+            expires_at=expires_at,
+        ),
+        invocation_id=invocation_id,
+    )
+
+    result = runtime.controller.begin(request, now=now)
+
+    record = runtime.execution_store.get(invocation_id)
+
+    return {
+        "invocation_id": invocation_id,
+        "claimed": result.allowed,
+        "permit_issued": result.permit is not None,
+        "state": record.state.value if record else None,
+        "attempt_count": record.attempt_count if record else None,
+        "claim_id": record.claim_id if record else None,
+        "side_effect_executed": False,
+    }
+    
+    
+@app.post("/failure/stale/{invocation_id}")
+def mark_claim_stale(invocation_id: str):
+    record = runtime.execution_store.get(invocation_id)
+
+    if record is None:
+        return JSONResponse(
+            status_code=404,
+            content={"found": False},
+        )
+
+    if record.claimed_at is None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "found": True,
+                "reason": "execution has no active claim",
+            },
+        )
+
+    changed = runtime.controller.mark_stale_claim_unknown(
+        invocation_id,
+        stale_after=timedelta(seconds=1),
+        now=record.claimed_at + timedelta(seconds=2),
+    )
+
+    updated = runtime.execution_store.get(invocation_id)
+
+    return {
+        "changed": changed,
+        "invocation_id": invocation_id,
+        "state": updated.state.value if updated else None,
+        "attempt_count": updated.attempt_count if updated else None,
+        "claim_id": updated.claim_id if updated else None,
     }
