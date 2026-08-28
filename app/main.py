@@ -398,3 +398,133 @@ def replay_invocation(invocation_id: str, payload: ReplayInput):
         status_code=409 if not result.allowed else 200,
         content=content,
     )
+    
+@app.post("/concurrency/prepare")
+def prepare_concurrency_test(payload: RefundInput):
+    now = datetime.now(UTC)
+
+    task_id = f"task-{uuid4().hex}"
+    invocation_id = f"inv-{uuid4().hex}"
+    resource = f"account/{payload.account_id}"
+    arguments = {"amount": payload.amount}
+    expires_at = now + timedelta(minutes=5)
+
+    runtime.invocation_store.register(
+        InvocationRecord(
+            invocation_id=invocation_id,
+            invoking_principal_id="fastapi-gateway",
+            executing_principal_id=payload.principal_id,
+            task_id=task_id,
+            action="refund",
+            resource=resource,
+            arguments_digest=compute_arguments_digest(arguments),
+            tool_id=TOOL_ID,
+            implementation_id=IMPLEMENTATION_ID,
+            recorded_at=now,
+            expires_at=expires_at,
+        )
+    )
+
+    return {
+        "invocation_id": invocation_id,
+        "task_id": task_id,
+        "account_id": payload.account_id,
+        "amount": payload.amount,
+        "principal_id": payload.principal_id,
+        "expires_at": expires_at.isoformat(),
+    }    
+    
+    
+@app.post("/concurrency/{invocation_id}")
+def concurrency_execute(invocation_id: str, payload: RefundInput):
+    canonical = runtime.invocation_store.get(invocation_id)
+
+    if canonical is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "invocation_id": invocation_id,
+                "executed": False,
+                "reason": "canonical invocation not found",
+            },
+        )
+
+    now = datetime.now(UTC)
+
+    request = AuthorizationRequest(
+        principal=Principal(
+            principal_id=payload.principal_id,
+            principal_type="agent",
+        ),
+        action="refund",
+        resource=f"account/{payload.account_id}",
+        arguments={"amount": payload.amount},
+        task=TaskContext(
+            task_id=canonical.task_id,
+            initiated_by="concurrency-test",
+            purpose="single-winner concurrency smoke test",
+            expires_at=canonical.expires_at,
+        ),
+        invocation_id=invocation_id,
+    )
+
+    begin = runtime.controller.begin(request, now=now)
+
+    if not begin.allowed or begin.permit is None:
+        record = runtime.execution_store.get(invocation_id)
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "invocation_id": invocation_id,
+                "executed": False,
+                "winner": False,
+                "permit_issued": False,
+                "reason": begin.reason,
+                "state": record.state.value if record else None,
+                "attempt_count": record.attempt_count if record else None,
+            },
+        )
+
+    revalidated = runtime.controller.revalidate_before_execution(
+        request,
+        begin.permit,
+    )
+
+    if not revalidated.allowed:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "invocation_id": invocation_id,
+                "executed": False,
+                "winner": False,
+                "reason": revalidated.reason,
+            },
+        )
+
+    side_effect = {
+        "refund_id": f"refund-{uuid4().hex}",
+        "account_id": payload.account_id,
+        "amount": payload.amount,
+        "invocation_id": invocation_id,
+        "claim_id": begin.permit.claim_id,
+    }
+
+    refund_side_effects.append(side_effect)
+
+    completed = runtime.controller.complete(begin.permit)
+
+    record = runtime.execution_store.get(invocation_id)
+
+    return {
+        "invocation_id": invocation_id,
+        "executed": True,
+        "winner": True,
+        "permit_issued": True,
+        "claim_id": begin.permit.claim_id,
+        "attempt": begin.permit.attempt,
+        "completion_recorded": completed,
+        "state": record.state.value if record else None,
+        "attempt_count": record.attempt_count if record else None,
+        "refund": side_effect,
+    }
