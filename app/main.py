@@ -705,3 +705,47 @@ def mark_claim_stale(invocation_id: str):
         "attempt_count": updated.attempt_count if updated else None,
         "claim_id": updated.claim_id if updated else None,
     }
+    
+    
+@app.post("/failure/reconcile/{invocation_id}")
+def reconcile_execution(
+    invocation_id: str,
+    payload: RecoveryInput,
+):
+    if payload.outcome == "side_effect_confirmed":
+        outcome = ExecutionRecoveryOutcome.SIDE_EFFECT_CONFIRMED
+
+    elif payload.outcome == "side_effect_not_applied":
+        outcome = ExecutionRecoveryOutcome.SIDE_EFFECT_NOT_APPLIED
+
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "outcome must be side_effect_confirmed or side_effect_not_applied"
+            },
+        )
+
+    before = runtime.execution_store.get(invocation_id)
+
+    changed = runtime.controller.reconcile_unknown(
+        invocation_id,
+        outcome=outcome,
+        reason=payload.reason,
+    )
+
+    after = runtime.execution_store.get(invocation_id)
+
+    return {
+        "reconciled": changed,
+        "invocation_id": invocation_id,
+        "state_before": before.state.value if before else None,
+        "state_after": after.state.value if after else None,
+        "attempt_count": after.attempt_count if after else None,
+        "recovery_count": after.recovery_count if after else None,
+        "recovery_outcome": (
+            after.recovery_outcome.value
+            if after and after.recovery_outcome
+            else None
+        ),
+    }
