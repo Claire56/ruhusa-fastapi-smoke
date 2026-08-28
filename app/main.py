@@ -302,3 +302,36 @@ def list_audit_events() -> dict[str, Any]:
         "chain_valid": _audit_chain_valid(),
         "events": [asdict(event) for event in events],
     }
+    
+    
+@app.get("/executions/{invocation_id}")
+def get_execution(invocation_id: str):
+    record = runtime.execution_store.get(invocation_id)
+
+    if record is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "found": False,
+                "invocation_id": invocation_id,
+            },
+        )
+
+    return {
+        "found": True,
+        "invocation_id": record.invocation_id,
+        "state": record.state.value,
+        "attempt_count": record.attempt_count,
+        "claim_id": record.claim_id,
+        "claimed_at": (
+            record.claimed_at.isoformat()
+            if record.claimed_at
+            else None
+        ),
+        "completed_at": (
+            record.completed_at.isoformat()
+            if record.completed_at
+            else None
+        ),
+        "recovery_count": record.recovery_count,
+    }
