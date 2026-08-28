@@ -26,6 +26,7 @@ jobs:
           - 5432:5432
     
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     
@@ -59,7 +60,7 @@ jobs:
       
       - name: Upload validation report
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: validation-report-py${{ matrix.python-version }}
           path: RUHUSA_V0_7_VALIDATION.md
@@ -71,7 +72,7 @@ jobs:
     
     steps:
       - name: Download reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
       
       - name: Check validation results
         run: |
