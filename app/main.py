@@ -38,6 +38,10 @@ class RefundInput(BaseModel):
     amount: float = Field(gt=0)
     principal_id: str = "billing-agent"
 
+class ReplayInput(BaseModel):
+    account_id: str = Field(min_length=1)
+    amount: float = Field(gt=0)
+    principal_id: str = "billing-agent"
 
 @dataclass
 class Runtime:
