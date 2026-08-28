@@ -339,3 +339,62 @@ def get_execution(invocation_id: str):
         ),
         "recovery_count": record.recovery_count,
     }
+
+@app.post("/replay/{invocation_id}")
+def replay_invocation(invocation_id: str, payload: ReplayInput):
+    canonical = runtime.invocation_store.get(invocation_id)
+
+    if canonical is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "found": False,
+                "invocation_id": invocation_id,
+            },
+        )
+
+    before = runtime.execution_store.get(invocation_id)
+
+    arguments = {"amount": payload.amount}
+
+    request = AuthorizationRequest(
+        principal=Principal(
+            principal_id=payload.principal_id,
+            principal_type="agent",
+        ),
+        action="refund",
+        resource=f"account/{payload.account_id}",
+        arguments=arguments,
+        task=TaskContext(
+            task_id=canonical.task_id,
+            initiated_by="replay-test",
+            purpose="replay protection smoke test",
+            expires_at=canonical.expires_at,
+        ),
+        invocation_id=invocation_id,
+    )
+
+    result = runtime.controller.begin(
+        request,
+        now=datetime.now(UTC),
+    )
+
+    after = runtime.execution_store.get(invocation_id)
+
+    content = {
+        "invocation_id": invocation_id,
+        "replay_blocked": not result.allowed,
+        "authorization_effect": result.authorization.effect.value,
+        "execution_allowed": result.allowed,
+        "permit_issued": result.permit is not None,
+        "reason": result.reason,
+        "state_before": before.state.value if before else None,
+        "state_after": after.state.value if after else None,
+        "attempt_count_before": before.attempt_count if before else None,
+        "attempt_count_after": after.attempt_count if after else None,
+    }
+
+    return JSONResponse(
+        status_code=409 if not result.allowed else 200,
+        content=content,
+    )
