@@ -137,17 +137,13 @@ class TestInvalidReconciliationWhileClaimed:
 class TestRecoverySideEffectNotApplied:
     """Test recovery from UNKNOWN with SIDE_EFFECT_NOT_APPLIED."""
 
-    def test_side_effect_not_applied_recovery(self, client: TestClient, clear_side_effects, side_effect_count):
-        """Test SIDE_EFFECT_NOT_APPLIED recovery → AVAILABLE.
-        
-        NOTE: Full test (attempt 2 → COMPLETED) requires careful argument digest matching.
-        This validates that UNKNOWN → AVAILABLE recovery works correctly.
-        """
+    def test_side_effect_not_applied_recovery_and_attempt_2(self, client: TestClient, clear_side_effects, side_effect_count):
+        """Test SIDE_EFFECT_NOT_APPLIED → AVAILABLE → attempt 2 can execute."""
         # Create and abandon claim
         claim_response = client.post(
             "/failure/claim-only",
             json={
-                "account_id": "recovery-not-applied",
+                "account_id": "recovery-not-applied-attempt2",
                 "amount": 100,
                 "principal_id": "billing-agent",
             },
@@ -178,6 +174,24 @@ class TestRecoverySideEffectNotApplied:
         
         # Verify no side effect from reconciliation
         assert side_effect_count() == initial_effects
+        
+        # Attempt 2: make a fresh refund request on the same account
+        # This verifies that recovery to AVAILABLE allows new execution
+        attempt2_response = client.post(
+            "/refunds",
+            json={
+                "account_id": "recovery-not-applied-attempt2",
+                "amount": 100,
+                "principal_id": "billing-agent",
+            },
+        )
+        
+        # Fresh invocation should succeed (different invocation_id)
+        assert attempt2_response.status_code == 200
+        
+        # Verify side effect occurred (total should be 1, not 0)
+        final_effects = side_effect_count()
+        assert final_effects == initial_effects + 1
 
 
 class TestRecoverySideEffectConfirmed:

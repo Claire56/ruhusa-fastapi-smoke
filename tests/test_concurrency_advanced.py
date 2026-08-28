@@ -49,6 +49,52 @@ class TestConcurrentReconciliation:
 
 
 @pytest.mark.postgres
+class TestPostgresExecutionConcurrency:
+    """Test PostgreSQL execution concurrency: 20 callers, same invocation, exactly 1 winner."""
+    
+    def test_postgres_concurrent_single_winner_25_rounds(self, client: TestClient, clear_side_effects, side_effect_count):
+        """Test 20 concurrent callers against same invocation for 25 rounds."""
+        for round_num in range(25):
+            # Prepare fresh invocation for each round
+            prep_response = client.post(
+                "/concurrency/prepare",
+                json={
+                    "account_id": f"postgres-concurrency-round-{round_num}",
+                    "amount": 100,
+                    "principal_id": "billing-agent",
+                },
+            )
+            
+            assert prep_response.status_code == 200
+            test_data = prep_response.json()
+            invocation_id = test_data["invocation_id"]
+            
+            # 20 concurrent callers
+            def concurrent_attempt(caller_id):
+                client_instance = TestClient(client.app)
+                response = client_instance.post(
+                    f"/concurrency/{invocation_id}",
+                    json={
+                        "account_id": test_data["account_id"],
+                        "amount": test_data["amount"],
+                        "principal_id": test_data["principal_id"],
+                    },
+                )
+                return response.json() if response.status_code in (200, 409) else None
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                results = list(executor.map(concurrent_attempt, range(20)))
+            
+            # Verify exactly 1 winner per round
+            winners = [r for r in results if r and r.get("winner") is True]
+            assert len(winners) == 1, f"Round {round_num}: expected 1 winner, got {len(winners)}"
+            
+            # Verify exactly 1 side effect per round
+            expected_count = round_num + 1
+            assert side_effect_count() == expected_count
+
+
+@pytest.mark.postgres
 class TestAuditConcurrency:
     """Test audit chain integrity under concurrent load."""
 

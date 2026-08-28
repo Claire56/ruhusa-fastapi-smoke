@@ -62,6 +62,8 @@ Expected output: `accepting connections`
 
 If you get connection errors, wait a few seconds and try again. PostgreSQL takes ~5-10 seconds to fully start.
 
+The `ruhusa_demo` database is automatically created by PostgreSQL from the `POSTGRES_DB` environment variable in `docker-compose.yml`. Ruhusa then initializes its schema and tables when it first connects.
+
 ### 4. Configure the DSN environment variable
 
 The validation tests need to know how to connect to PostgreSQL:
@@ -132,14 +134,20 @@ docker compose logs postgres
 
 ### Want a fresh PostgreSQL database
 
-Stop and remove volumes:
+The `docker-compose.yml` defines a named volume `postgres_data` that persists data across `docker compose down/up` cycles. 
+
+To truly delete all data:
 
 ```bash
 docker compose down -v
 docker compose up -d postgres
 ```
 
-This creates a brand new, empty database.
+The `-v` flag removes named volumes, creating a brand new, empty database.
+
+**Data persistence:** By default, `docker compose down` preserves data in the `postgres_data` volume. Your test data survives container restarts.
+
+**Data deletion:** Only `docker compose down -v` deletes the volume and all data.
 
 ## Running Specific Test Categories
 

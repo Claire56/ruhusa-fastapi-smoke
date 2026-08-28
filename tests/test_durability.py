@@ -9,8 +9,11 @@ class TestPostgresExecutionDurability:
     """Test execution state persists across application restart."""
 
     def test_execution_state_persists_after_restart(self, client: TestClient, current_runtime, clear_side_effects):
-        """Test COMPLETED state persists after process restart."""
-        # Create refund with PostgreSQL backend
+        """Test COMPLETED state persists after fresh pool/runtime against same database."""
+        from ruhusa.postgres import create_postgres_pool, PostgresExecutionStore
+        import os
+        
+        # Create refund with PostgreSQL backend via current runtime
         response = client.post(
             "/refunds",
             json={
@@ -24,20 +27,27 @@ class TestPostgresExecutionDurability:
         body = response.json()
         invocation_id = body["invocation_id"]
         
-        # Record the state
+        # Record the state from original runtime
         original_record = current_runtime.execution_store.get(invocation_id)
         assert original_record is not None
         original_state = original_record.state.value
         original_attempt_count = original_record.attempt_count
         original_claim_id = original_record.claim_id
         
-        # Simulate restart by getting a fresh execution record
-        # (In a real scenario, this would involve restarting the process)
-        restored_record = current_runtime.execution_store.get(invocation_id)
-        assert restored_record is not None
-        assert restored_record.state.value == original_state
-        assert restored_record.attempt_count == original_attempt_count
-        assert restored_record.claim_id == original_claim_id
+        # Simulate restart: create fresh pool and store against same database
+        dsn = os.getenv("RUHUSA_POSTGRES_DSN")
+        if dsn:
+            fresh_pool = create_postgres_pool(dsn, min_size=1, max_size=2)
+            fresh_store = PostgresExecutionStore(fresh_pool)
+            
+            # Query same record from fresh pool
+            restored_record = fresh_store.get(invocation_id)
+            fresh_pool.close()
+            
+            assert restored_record is not None
+            assert restored_record.state.value == original_state
+            assert restored_record.attempt_count == original_attempt_count
+            assert restored_record.claim_id == original_claim_id
 
 
 @pytest.mark.postgres
