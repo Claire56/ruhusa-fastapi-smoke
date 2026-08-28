@@ -1,0 +1,155 @@
+---
+name: validate-ruhusa-release
+description: Validate a released Ruhusa version from this external FastAPI consumer application. Use when testing Ruhusa authorization, provenance, replay protection, concurrency, PostgreSQL durability, audit integrity, fail-closed behavior, execution recovery, or release readiness.
+disable-model-invocation: true
+icon: shield
+color: green
+---
+
+# Validate Ruhusa Release
+
+Validate the installed Ruhusa release using this repository as an
+independent external consumer.
+
+This skill validates the released framework. It must not modify the
+Ruhusa repository or weaken tests to make failures pass.
+
+## Core rule
+
+Treat every failing test as evidence.
+
+Classify failures as one of:
+
+- Ruhusa bug
+- smoke-app integration issue
+- documentation/usability issue
+- upstream dependency issue
+- environment/infrastructure issue
+
+Do not modify Ruhusa automatically.
+
+## Before testing
+
+1. Determine the Ruhusa version installed by this project.
+2. Confirm it matches the version intended for validation.
+3. Confirm Python satisfies Ruhusa's supported version.
+4. Run the basic in-memory suite.
+5. Confirm Docker/PostgreSQL availability before PostgreSQL tests.
+6. Use a dedicated test database for destructive tests.
+
+## Security invariants
+
+The following must never be weakened:
+
+- default deny
+- fail closed
+- no unaudited ALLOW
+- canonical invocation integrity
+- immutable tool identity
+- no delegated authority expansion
+- execution-time revalidation
+- completed invocation cannot replay
+- UNKNOWN cannot automatically retry
+- only trusted reconciliation may recover UNKNOWN
+- stale execution permits cannot mutate newer attempts
+- exactly one execution winner under concurrency
+- protected side effects must not occur when authorization or trusted
+  security state is unavailable
+
+## Validation workflow
+
+Read:
+
+`references/validation-matrix.md`
+
+Run every applicable validation category in that matrix.
+
+For PostgreSQL tests:
+
+- use real PostgreSQL
+- do not mock PostgreSQL stores
+- verify persistence across application restart
+- verify persistence across PostgreSQL restart
+- verify concurrent database behavior
+
+For concurrency:
+
+- use at least 20 concurrent callers
+- repeat the race multiple times
+- require exactly one winner per invocation
+- require exactly one protected side effect
+
+For failure tests:
+
+- verify the side-effect counter, not only HTTP status
+- backend failure must not produce a protected side effect
+
+For UNKNOWN recovery:
+
+- test SIDE_EFFECT_NOT_APPLIED
+- test SIDE_EFFECT_CONFIRMED
+- test invalid reconciliation while CLAIMED
+- test retry blocked while UNKNOWN
+- test stale permit fencing
+- test recovery does not bypass fresh authorization
+
+For audit:
+
+- validate hash-chain integrity
+- validate concurrent writers
+- validate persistence
+- test tamper detection only against an isolated test database
+
+## Do not
+
+Do not:
+
+- add FastAPI to Ruhusa
+- modify the Ruhusa repository
+- change Ruhusa security behavior
+- bypass failed tests
+- silently retry UNKNOWN operations
+- replace PostgreSQL integration tests with mocks
+- classify a test as PASS unless it actually ran
+- run destructive tamper tests against non-test data
+
+## Final report
+
+Generate or update:
+
+`RUHUSA_V0_7_VALIDATION.md`
+
+Include:
+
+| Test | Security property | Backend | Result | Evidence |
+|------|-------------------|---------|--------|----------|
+
+Allowed results:
+
+- PASS
+- FAIL
+- NOT TESTED
+
+Also report:
+
+- Ruhusa version
+- Python version
+- FastAPI version
+- PostgreSQL version
+- total tests
+- passed
+- failed
+- skipped
+- PostgreSQL tests executed
+- security failures
+- integration findings
+- documentation findings
+
+At the end provide a release-validation verdict:
+
+- PASS
+- PASS WITH FINDINGS
+- FAIL
+
+A FAIL caused by a security invariant must be highlighted separately and
+must not be automatically fixed.

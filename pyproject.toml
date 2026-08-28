@@ -21,3 +21,6 @@ ruhusa = { git = "https://github.com/Claire56/ruhusa.git", tag = "v0.7.0" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "postgres: mark test as requiring PostgreSQL backend",
+]
