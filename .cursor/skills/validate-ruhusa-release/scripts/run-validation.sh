@@ -53,8 +53,12 @@ fi
 # PostgreSQL tests (optional)
 echo ""
 echo "PostgreSQL tests (if RUHUSA_POSTGRES_DSN configured)..."
+POSTGRES_TESTS_OUTPUT=""
 if [ -n "$RUHUSA_POSTGRES_DSN" ]; then
-    if uv run pytest tests/ -v -m postgres --tb=short; then
+    POSTGRES_TESTS_OUTPUT=$(uv run pytest tests/ -v -m postgres --tb=short 2>&1)
+    POSTGRES_EXIT=$?
+    echo "$POSTGRES_TESTS_OUTPUT"
+    if [ $POSTGRES_EXIT -eq 0 ]; then
         echo "✓ PostgreSQL tests passed"
     else
         echo "✗ PostgreSQL tests had failures"
@@ -62,6 +66,46 @@ if [ -n "$RUHUSA_POSTGRES_DSN" ]; then
     fi
 else
     echo "⊘ RUHUSA_POSTGRES_DSN not set; PostgreSQL tests skipped"
+fi
+
+# Check for skipped tests that need manual coordination
+echo ""
+echo "======================================"
+echo "Checking for tests requiring manual coordination..."
+echo "======================================"
+
+if echo "$POSTGRES_TESTS_OUTPUT" | grep -q "test_postgresql_unavailable_denies_execution.*SKIPPED"; then
+    echo ""
+    echo "⚠️  PostgreSQL outage/recovery test was SKIPPED"
+    echo "This test requires stopping PostgreSQL while FastAPI runs."
+    echo ""
+    echo "To run manually:"
+    echo "  1. docker compose stop postgres"
+    echo "  2. uv run pytest tests/test_durability.py::TestPostgresOutageAndRecovery::test_postgresql_unavailable_denies_execution -v"
+    echo "  3. docker compose start postgres"
+    echo ""
+fi
+
+if echo "$POSTGRES_TESTS_OUTPUT" | grep -q "test_postgres_container_restart_preserves_data.*SKIPPED"; then
+    echo ""
+    echo "⚠️  PostgreSQL container restart test was SKIPPED"
+    echo "This test requires restarting the PostgreSQL container while other tests don't run."
+    echo ""
+    echo "To run manually (ensure no other tests are running):"
+    echo "  uv run pytest tests/test_durability.py::TestPostgresRestartDurability::test_postgres_container_restart_preserves_data -v"
+    echo ""
+fi
+
+if echo "$POSTGRES_TESTS_OUTPUT" | grep -q "test_tamper_detection_requires_isolated_database.*SKIPPED"; then
+    echo ""
+    echo "⚠️  Tamper detection test was SKIPPED"
+    echo "This test requires an isolated PostgreSQL database."
+    echo ""
+    echo "To run manually:"
+    echo "  1. docker exec ruhusa-fastapi-smoke-postgres-1 createdb ruhusa_test_tamper -U postgres"
+    echo "  2. RUHUSA_POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/ruhusa_test_tamper uv run pytest tests/test_tamper.py -v"
+    echo "  3. docker exec ruhusa-fastapi-smoke-postgres-1 dropdb ruhusa_test_tamper -U postgres"
+    echo ""
 fi
 
 # Generate report

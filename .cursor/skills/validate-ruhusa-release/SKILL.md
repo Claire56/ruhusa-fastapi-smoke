@@ -37,6 +37,36 @@ Do not modify Ruhusa automatically.
 5. Set up PostgreSQL before running PostgreSQL tests (see below).
 6. Use a dedicated test database for destructive tests.
 
+## When you need help
+
+Some tests require manual infrastructure coordination that the skill cannot automate:
+
+**PostgreSQL outage/recovery test**: If skipped due to isolation requirements, ask the user to:
+```bash
+docker compose stop postgres        # Stop PostgreSQL
+uv run pytest tests/test_durability.py::TestPostgresOutageAndRecovery::test_postgresql_unavailable_denies_execution -v
+docker compose start postgres       # Restart PostgreSQL
+```
+
+**PostgreSQL container restart test**: If skipped, ask the user to run the test in isolation:
+```bash
+uv run pytest tests/test_durability.py::TestPostgresRestartDurability::test_postgres_container_restart_preserves_data -v
+```
+
+**Tamper detection test**: If skipped, ask the user to:
+1. Create an isolated test database:
+```bash
+docker exec ruhusa-fastapi-smoke-postgres-1 createdb ruhusa_test_tamper -U postgres
+```
+2. Point the test at that database
+3. Run the tamper test
+4. Clean up: `docker exec ruhusa-fastapi-smoke-postgres-1 dropdb ruhusa_test_tamper -U postgres`
+
+**FastAPI process restart test (audit durability)**: If needed, ask the user to:
+1. Let the test run to generate audit events
+2. Kill and restart the FastAPI process
+3. Verify the audit chain persists
+
 ## PostgreSQL Setup
 
 Before running PostgreSQL tests, start the database:

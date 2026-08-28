@@ -56,7 +56,9 @@ jobs:
       
       - name: Generate validation report
         if: always()
-        run: python tests/report_generator.py > RUHUSA_V0_7_VALIDATION.md 2>&1 || true
+        env:
+          RUHUSA_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/ruhusa_demo
+        run: uv run python tests/report_generator.py > RUHUSA_V0_7_VALIDATION.md
       
       - name: Upload validation report
         if: always()

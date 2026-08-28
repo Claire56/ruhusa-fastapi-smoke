@@ -175,10 +175,23 @@ class TestPermitFencing:
         assert permit2.attempt == 2
         
         # Old permit from attempt 1 must not be able to complete attempt 2
-        # This is enforced by the permit containing the invocation_id, claim_id, and attempt
         # Attempting to complete with permit1 (attempt=1) when record is attempt=2 should fail
+        stale_complete = current_runtime.controller.complete(permit1)
+        assert stale_complete is False
         
-        # The controller should reject completing with a stale permit
-        # (This depends on Ruhusa's implementation of permit validation during complete())
-        # For now, we verify permit2 is different from permit1
-        assert permit1.claim_id != permit2.claim_id or permit1.attempt != permit2.attempt
+        # Verify attempt 2 remains CLAIMED (not corrupted by stale permit)
+        record_after_stale = current_runtime.execution_store.get(invocation_id)
+        assert record_after_stale.state.value == "claimed"
+        assert record_after_stale.attempt_count == 2
+        
+        # New permit from attempt 2 must successfully complete
+        revalidated = current_runtime.controller.revalidate_before_execution(request2, permit2)
+        assert revalidated.allowed is True
+        
+        final_complete = current_runtime.controller.complete(permit2)
+        assert final_complete is True
+        
+        # Verify final state
+        record_final = current_runtime.execution_store.get(invocation_id)
+        assert record_final.state.value == "completed"
+        assert record_final.attempt_count == 2

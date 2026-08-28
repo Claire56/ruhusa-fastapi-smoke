@@ -95,20 +95,35 @@ def generate_report(results: dict) -> str:
     
     # Determine verdict
     in_mem_passed = in_mem["exit_code"] == 0 and in_mem["failed"] == 0
+    has_skipped_mandatory = total_skipped > 0
+    
+    # Build list of NOT TESTED items
+    not_tested = []
+    if not postgres["configured"]:
+        not_tested.append("PostgreSQL integration (RUHUSA_POSTGRES_DSN not configured)")
+    if postgres["configured"] and postgres["skipped"] > 0:
+        not_tested.append(f"Tamper detection ({postgres['skipped']} test skipped)")
     
     if postgres["configured"]:
         postgres_passed = postgres["exit_code"] == 0 and postgres["failed"] == 0
-        all_passed = in_mem_passed and postgres_passed
-        if all_passed:
+        all_passed = in_mem_passed and postgres_passed and not has_skipped_mandatory
+        
+        if total_failed > 0:
+            verdict = "FAIL"
+            verdict_detail = "Validation failed due to test failures. See test results below."
+        elif all_passed:
             verdict = "PASS"
             verdict_detail = "All security validation passed, including PostgreSQL integration."
         else:
-            verdict = "FAIL"
-            verdict_detail = "Validation failed. See test results below."
+            verdict = "PASS WITH FINDINGS"
+            verdict_detail = "Core security validation passed. Some mandatory integration tests were not executed (marked NOT TESTED below)."
     else:
         postgres_passed = False
-        if in_mem_passed:
-            verdict = "PASS WITH CRITICAL GAPS"
+        if total_failed > 0:
+            verdict = "FAIL"
+            verdict_detail = "In-memory validation failed. PostgreSQL tests not attempted."
+        elif in_mem_passed:
+            verdict = "PASS WITH FINDINGS"
             verdict_detail = "In-memory security validation passed. PostgreSQL integration NOT TESTED (RUHUSA_POSTGRES_DSN not configured)."
         else:
             verdict = "FAIL"
@@ -169,7 +184,7 @@ def generate_report(results: dict) -> str:
 
 ### What Was NOT Tested
 
-{"⊘ PostgreSQL integration (RUHUSA_POSTGRES_DSN not configured)" if not postgres["configured"] else ""}
+{("⊘ " + chr(10) + "⊘ ".join(not_tested)) if not_tested else "All mandatory tests were executed."}
 
 ---
 
