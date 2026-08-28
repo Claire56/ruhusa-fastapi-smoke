@@ -114,6 +114,101 @@ class TestAuthorizationDeny:
 class TestAuthorizationExpiration:
     """Test task and invocation expiration."""
 
+    def test_expired_task_denied(self, client: TestClient, current_runtime, clear_side_effects):
+        """Test that expired tasks are denied."""
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+        from ruhusa import InvocationRecord, Principal, AuthorizationRequest, TaskContext, compute_arguments_digest
+        from app.main import TOOL_ID, IMPLEMENTATION_ID
+        
+        now = datetime.now(UTC)
+        invocation_id = f"inv-{uuid4().hex}"
+        task_id = f"task-{uuid4().hex}"
+        
+        # Register invocation
+        current_runtime.invocation_store.register(
+            InvocationRecord(
+                invocation_id=invocation_id,
+                invoking_principal_id="fastapi-gateway",
+                executing_principal_id="billing-agent",
+                task_id=task_id,
+                action="refund",
+                resource="account/expired-task",
+                arguments_digest=compute_arguments_digest({"amount": 100}),
+                tool_id=TOOL_ID,
+                implementation_id=IMPLEMENTATION_ID,
+                recorded_at=now,
+                expires_at=now + timedelta(minutes=5),
+            )
+        )
+        
+        # Create authorization request with expired task
+        request = AuthorizationRequest(
+            principal=Principal(principal_id="billing-agent", principal_type="agent"),
+            action="refund",
+            resource="account/expired-task",
+            arguments={"amount": 100},
+            task=TaskContext(
+                task_id=task_id,
+                initiated_by="test",
+                purpose="test",
+                expires_at=now - timedelta(minutes=1),  # Already expired
+            ),
+            invocation_id=invocation_id,
+        )
+        
+        decision = current_runtime.authorizer.authorize(request, now=now)
+        assert decision.allowed is False
+        
+        # Verify no side effect
+        response = client.get("/refunds")
+        assert response.json()["count"] == 0
+
+    def test_expired_invocation_denied(self, client: TestClient, current_runtime, clear_side_effects):
+        """Test that invocations with expired expiration time are denied."""
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+        from ruhusa import InvocationRecord, Principal, AuthorizationRequest, TaskContext, compute_arguments_digest
+        from app.main import TOOL_ID, IMPLEMENTATION_ID
+        
+        now = datetime.now(UTC)
+        invocation_id = f"inv-{uuid4().hex}"
+        task_id = f"task-{uuid4().hex}"
+        
+        # Register invocation that has already expired
+        current_runtime.invocation_store.register(
+            InvocationRecord(
+                invocation_id=invocation_id,
+                invoking_principal_id="fastapi-gateway",
+                executing_principal_id="billing-agent",
+                task_id=task_id,
+                action="refund",
+                resource="account/expired-invocation",
+                arguments_digest=compute_arguments_digest({"amount": 100}),
+                tool_id=TOOL_ID,
+                implementation_id=IMPLEMENTATION_ID,
+                recorded_at=now - timedelta(minutes=10),
+                expires_at=now - timedelta(minutes=5),  # Already expired
+            )
+        )
+        
+        request = AuthorizationRequest(
+            principal=Principal(principal_id="billing-agent", principal_type="agent"),
+            action="refund",
+            resource="account/expired-invocation",
+            arguments={"amount": 100},
+            task=TaskContext(
+                task_id=task_id,
+                initiated_by="test",
+                purpose="test",
+                expires_at=now + timedelta(minutes=5),
+            ),
+            invocation_id=invocation_id,
+        )
+        
+        decision = current_runtime.authorizer.authorize(request, now=now)
+        assert decision.allowed is False
+
     def test_audit_events_created_for_decisions(self, client: TestClient, clear_side_effects):
         """Test that all authorization decisions create audit events."""
         # ALLOW

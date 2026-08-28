@@ -43,7 +43,12 @@ class TestUnknownBlocksAutomaticRetry:
     """Test that UNKNOWN state blocks automatic retry."""
 
     def test_unknown_execution_blocked(self, client: TestClient, current_runtime, clear_side_effects, side_effect_count):
-        """Test that execution is blocked while UNKNOWN."""
+        """Test that execution attempt is rejected while UNKNOWN."""
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+        from ruhusa import InvocationRecord, Principal, AuthorizationRequest, TaskContext, compute_arguments_digest
+        from app.main import TOOL_ID, IMPLEMENTATION_ID
+        
         # Create and abandon a claim
         claim_response = client.post(
             "/failure/claim-only",
@@ -56,10 +61,10 @@ class TestUnknownBlocksAutomaticRetry:
         
         invocation_id = claim_response.json()["invocation_id"]
         
-        # Mark as stale
+        # Mark as stale → UNKNOWN
         client.post(f"/failure/stale/{invocation_id}")
         
-        # Verify execution is blocked
+        # Verify state is UNKNOWN
         execution_response = client.get(f"/executions/{invocation_id}")
         assert execution_response.status_code == 200
         exec_data = execution_response.json()
@@ -67,9 +72,31 @@ class TestUnknownBlocksAutomaticRetry:
         
         initial_effects = side_effect_count()
         
-        # Try to execute while UNKNOWN - should be blocked
-        # Cannot use /refunds since it creates new invocation
-        # Verify no automatic retry occurred
+        # Attempt execution while UNKNOWN - must be rejected
+        now = datetime.now(UTC)
+        canonical = current_runtime.invocation_store.get(invocation_id)
+        
+        request = AuthorizationRequest(
+            principal=Principal(principal_id="billing-agent", principal_type="agent"),
+            action="refund",
+            resource=f"account/unknown-block-test",
+            arguments={"amount": 100},
+            task=TaskContext(
+                task_id=canonical.task_id,
+                initiated_by="test",
+                purpose="retry during UNKNOWN",
+                expires_at=canonical.expires_at,
+            ),
+            invocation_id=invocation_id,
+        )
+        
+        # Attempt to begin() while UNKNOWN
+        begin = current_runtime.controller.begin(request, now=now)
+        
+        # Must be rejected
+        assert begin.allowed is False
+        
+        # Verify no side effect occurred
         final_effects = side_effect_count()
         assert final_effects == initial_effects
 
@@ -111,7 +138,11 @@ class TestRecoverySideEffectNotApplied:
     """Test recovery from UNKNOWN with SIDE_EFFECT_NOT_APPLIED."""
 
     def test_side_effect_not_applied_recovery(self, client: TestClient, clear_side_effects, side_effect_count):
-        """Test SIDE_EFFECT_NOT_APPLIED recovery → AVAILABLE."""
+        """Test SIDE_EFFECT_NOT_APPLIED recovery → AVAILABLE.
+        
+        NOTE: Full test (attempt 2 → COMPLETED) requires careful argument digest matching.
+        This validates that UNKNOWN → AVAILABLE recovery works correctly.
+        """
         # Create and abandon claim
         claim_response = client.post(
             "/failure/claim-only",
@@ -124,12 +155,12 @@ class TestRecoverySideEffectNotApplied:
         
         invocation_id = claim_response.json()["invocation_id"]
         
-        # Mark stale
+        # Mark stale → UNKNOWN
         client.post(f"/failure/stale/{invocation_id}")
         
         initial_effects = side_effect_count()
         
-        # Reconcile as not applied
+        # Reconcile as not applied → AVAILABLE
         reconcile_response = client.post(
             f"/failure/reconcile/{invocation_id}",
             json={
@@ -145,15 +176,18 @@ class TestRecoverySideEffectNotApplied:
         assert body["state_after"] == "available"
         assert body["recovery_count"] == 1
         
-        # Verify no side effect from reconciliation itself
+        # Verify no side effect from reconciliation
         assert side_effect_count() == initial_effects
 
 
 class TestRecoverySideEffectConfirmed:
     """Test recovery from UNKNOWN with SIDE_EFFECT_CONFIRMED."""
 
-    def test_side_effect_confirmed_recovery(self, client: TestClient, clear_side_effects, side_effect_count):
-        """Test SIDE_EFFECT_CONFIRMED recovery → COMPLETED."""
+    def test_side_effect_confirmed_recovery_blocks_retry(self, client: TestClient, current_runtime, clear_side_effects, side_effect_count):
+        """Test SIDE_EFFECT_CONFIRMED recovery → COMPLETED → retry blocked."""
+        from datetime import UTC, datetime, timedelta
+        from ruhusa import Principal, AuthorizationRequest, TaskContext
+        
         # Create and abandon claim
         claim_response = client.post(
             "/failure/claim-only",
@@ -165,13 +199,14 @@ class TestRecoverySideEffectConfirmed:
         )
         
         invocation_id = claim_response.json()["invocation_id"]
+        canonical = current_runtime.invocation_store.get(invocation_id)
         
-        # Mark stale
+        # Mark stale → UNKNOWN
         client.post(f"/failure/stale/{invocation_id}")
         
         initial_effects = side_effect_count()
         
-        # Reconcile as confirmed
+        # Reconcile as confirmed → COMPLETED
         reconcile_response = client.post(
             f"/failure/reconcile/{invocation_id}",
             json={
@@ -188,4 +223,91 @@ class TestRecoverySideEffectConfirmed:
         assert body["recovery_count"] == 1
         
         # Verify no additional side effect
+        assert side_effect_count() == initial_effects
+        
+        # Attempt to retry while COMPLETED - must be blocked
+        now = datetime.now(UTC)
+        request = AuthorizationRequest(
+            principal=Principal(principal_id="billing-agent", principal_type="agent"),
+            action="refund",
+            resource=f"account/recovery-confirmed",
+            arguments={"amount": 100},
+            task=TaskContext(
+                task_id=canonical.task_id,
+                initiated_by="test",
+                purpose="retry after confirmed",
+                expires_at=canonical.expires_at,
+            ),
+            invocation_id=invocation_id,
+        )
+        
+        # Attempt begin() after COMPLETED
+        begin = current_runtime.controller.begin(request, now=now)
+        
+        # Must be blocked (already completed)
+        assert begin.allowed is False
+        
+        # Verify no additional side effect
+        assert side_effect_count() == initial_effects
+
+
+class TestRecoveryAuthorizationBypass:
+    """Test that recovery does not bypass authorization checks."""
+
+    def test_recovery_followed_by_expired_task_denied(self, client: TestClient, current_runtime, clear_side_effects, side_effect_count):
+        """Test that recovery → AVAILABLE doesn't execute if task expires."""
+        from datetime import UTC, datetime, timedelta
+        from ruhusa import Principal, AuthorizationRequest, TaskContext
+        
+        # Create and abandon claim
+        claim_response = client.post(
+            "/failure/claim-only",
+            json={
+                "account_id": "recovery-expired",
+                "amount": 100,
+                "principal_id": "billing-agent",
+            },
+        )
+        
+        invocation_id = claim_response.json()["invocation_id"]
+        canonical = current_runtime.invocation_store.get(invocation_id)
+        
+        # Mark stale
+        client.post(f"/failure/stale/{invocation_id}")
+        
+        initial_effects = side_effect_count()
+        
+        # Reconcile → AVAILABLE
+        reconcile_response = client.post(
+            f"/failure/reconcile/{invocation_id}",
+            json={
+                "outcome": "side_effect_not_applied",
+                "reason": "verified no changes",
+            },
+        )
+        
+        assert reconcile_response.status_code == 200
+        assert reconcile_response.json()["state_after"] == "available"
+        
+        # Now attempt execution with EXPIRED task
+        now = datetime.now(UTC)
+        request = AuthorizationRequest(
+            principal=Principal(principal_id="billing-agent", principal_type="agent"),
+            action="refund",
+            resource=f"account/recovery-expired",
+            arguments={"amount": 100},
+            task=TaskContext(
+                task_id=canonical.task_id,
+                initiated_by="test",
+                purpose="attempt with expired task",
+                expires_at=now - timedelta(minutes=1),  # Task expired
+            ),
+            invocation_id=invocation_id,
+        )
+        
+        # Should be denied due to expired task, even though recovered to AVAILABLE
+        begin = current_runtime.controller.begin(request, now=now)
+        assert begin.allowed is False
+        
+        # Verify no side effect
         assert side_effect_count() == initial_effects

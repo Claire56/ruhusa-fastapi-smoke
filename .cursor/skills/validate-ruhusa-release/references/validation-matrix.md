@@ -17,6 +17,16 @@ Use this repository (`ruhusa-fastapi-smoke`) as an **external consumer applicati
 - Every protected side-effect test must assert the number of actual side effects, not just HTTP status.
 - Tests must clean up after themselves or use unique UUID-based invocation/task/account IDs.
 
+### PostgreSQL Setup for First Run
+
+See `../POSTGRES_SETUP.md` for complete instructions. Quick version:
+
+```bash
+docker compose up -d postgres
+export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@localhost:5432/ruhusa_demo"
+uv run pytest tests/ -v
+```
+
 ---
 
 ## Test Categories

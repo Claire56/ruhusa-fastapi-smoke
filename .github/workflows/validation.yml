@@ -1,0 +1,86 @@
+name: Ruhusa v0.7.0 Validation
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ruhusa_demo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+      
+      - name: Sync dependencies
+        run: uv sync
+      
+      - name: Run in-memory tests
+        run: uv run pytest tests/ -v -m "not postgres" --tb=short
+      
+      - name: Run PostgreSQL tests
+        env:
+          RUHUSA_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/ruhusa_demo
+        run: uv run pytest tests/ -v -m postgres --tb=short
+      
+      - name: Generate validation report
+        if: always()
+        run: python tests/report_generator.py > RUHUSA_V0_7_VALIDATION.md 2>&1 || true
+      
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-report-py${{ matrix.python-version }}
+          path: RUHUSA_V0_7_VALIDATION.md
+
+  summary:
+    needs: validation
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download reports
+        uses: actions/download-artifact@v3
+      
+      - name: Check validation results
+        run: |
+          echo "## Ruhusa v0.7.0 Validation Results"
+          echo ""
+          for report in validation-report-*/*.md; do
+            if [ -f "$report" ]; then
+              echo "### Python $(dirname $report | sed 's/validation-report-//')"
+              head -50 "$report"
+              echo "..."
+            fi
+          done

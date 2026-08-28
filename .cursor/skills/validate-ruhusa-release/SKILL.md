@@ -34,8 +34,39 @@ Do not modify Ruhusa automatically.
 2. Confirm it matches the version intended for validation.
 3. Confirm Python satisfies Ruhusa's supported version.
 4. Run the basic in-memory suite.
-5. Confirm Docker/PostgreSQL availability before PostgreSQL tests.
+5. Set up PostgreSQL before running PostgreSQL tests (see below).
 6. Use a dedicated test database for destructive tests.
+
+## PostgreSQL Setup
+
+Before running PostgreSQL tests, start the database:
+
+```bash
+# Start PostgreSQL 17 service
+docker compose up -d postgres
+
+# Verify it's ready
+docker compose exec postgres pg_isready -U postgres
+
+# Set the environment variable for tests
+export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@localhost:5432/ruhusa_demo"
+```
+
+Then run tests with PostgreSQL:
+
+```bash
+# Run all tests (in-memory + PostgreSQL)
+uv run pytest tests/ -v
+
+# Or just PostgreSQL tests
+uv run pytest tests/ -v -m postgres
+```
+
+To stop PostgreSQL after testing:
+
+```bash
+docker compose down
+```
 
 ## Security invariants
 
