@@ -1,216 +1,369 @@
 ---
 name: validate-ruhusa-release
-description: Validate a released Ruhusa version from this external FastAPI consumer application. Use when testing Ruhusa authorization, provenance, replay protection, concurrency, PostgreSQL durability, audit integrity, fail-closed behavior, execution recovery, or release readiness.
-disable-model-invocation: true
-icon: shield
-color: green
+description: >
+  Run the complete external validation harness for the Ruhusa version pinned in
+  pyproject.toml. Use for release sign-off, PR review, or when any security
+  invariant needs verification. Covers authorization, provenance, replay,
+  concurrency, UNKNOWN recovery, PostgreSQL durability, real outage/restart
+  resilience, and audit tamper evidence.
 ---
 
-# Validate Ruhusa Release
+# Ruhusa Release Validation Skill
 
-Validate the installed Ruhusa release using this repository as an
-independent external consumer.
+This skill runs the external consumer validation harness for Ruhusa.
+You are acting as an external verifier. **Never modify Ruhusa itself.**
+Every failing test is evidence — classify it, do not suppress it.
 
-This skill validates the released framework. It must not modify the
-Ruhusa repository or weaken tests to make failures pass.
+---
 
-## Core rule
+## Step 0 — Read context before doing anything else
 
-Treat every failing test as evidence.
-
-Classify failures as one of:
-
-- Ruhusa bug
-- smoke-app integration issue
-- documentation/usability issue
-- upstream dependency issue
-- environment/infrastructure issue
-
-Do not modify Ruhusa automatically.
-
-## Before testing
-
-1. Determine the Ruhusa version installed by this project.
-2. Confirm it matches the version intended for validation.
-3. Confirm Python satisfies Ruhusa's supported version.
-4. Run the basic in-memory suite.
-5. Set up PostgreSQL before running PostgreSQL tests (see below).
-6. Use a dedicated test database for destructive tests.
-
-## When you need help
-
-Some tests require manual infrastructure coordination that the skill cannot automate:
-
-**PostgreSQL outage/recovery test**: If skipped due to isolation requirements, ask the user to:
 ```bash
-docker compose stop postgres        # Stop PostgreSQL
-uv run pytest tests/test_durability.py::TestPostgresOutageAndRecovery::test_postgresql_unavailable_denies_execution -v
-docker compose start postgres       # Restart PostgreSQL
+cat pyproject.toml | grep -A3 "\[tool.uv.sources\]"
+python3 --version
+uv --version
+docker --version 2>/dev/null || echo "Docker not available"
 ```
 
-**PostgreSQL container restart test**: If skipped, ask the user to run the test in isolation:
+Record:
+- Ruhusa version tag (from `pyproject.toml`)
+- Python version
+- Whether Docker is available
+
+If Python < 3.12, stop and report: **ENVIRONMENT FAIL — Python 3.12+ required.**
+
+---
+
+## Step 1 — Install dependencies
+
 ```bash
-uv run pytest tests/test_durability.py::TestPostgresRestartDurability::test_postgres_container_restart_preserves_data -v
+uv sync
 ```
 
-**Tamper detection test**: If skipped, ask the user to:
-1. Create an isolated test database:
+If this fails, check the git tag in `pyproject.toml` is reachable and that
+the network is available. Report any failure as **ENVIRONMENT FAIL**.
+
+---
+
+## Step 2 — Run the in-memory test suite
+
 ```bash
-docker exec ruhusa-fastapi-smoke-postgres-1 createdb ruhusa_test_tamper -U postgres
+mkdir -p .validation-results
+uv run pytest tests/ \
+  -m "not postgres" \
+  --tb=short \
+  --junitxml=".validation-results/in-memory.xml" \
+  2>&1 | tee .validation-results/in-memory.log
 ```
-2. Point the test at that database
-3. Run the tamper test
-4. Clean up: `docker exec ruhusa-fastapi-smoke-postgres-1 dropdb ruhusa_test_tamper -U postgres`
 
-**FastAPI process restart test (audit durability)**: If needed, ask the user to:
-1. Let the test run to generate audit events
-2. Kill and restart the FastAPI process
-3. Verify the audit chain persists
+### What to check
 
-## PostgreSQL Setup
+Open `.validation-results/in-memory.log`. Confirm:
 
-Before running PostgreSQL tests, start the database:
+| Check | Expected |
+|---|---|
+| Exit code | 0 |
+| Failed tests | 0 |
+| Skipped tests | 0 |
+| Tests collected | ≥ 38 |
+
+### What each test group covers
+
+- `test_authorization.py` — default deny, ALLOW, REQUIRE_APPROVAL, DENY, expired task/invocation
+- `test_provenance.py` — principal/action/resource/arguments/tool integrity
+- `test_execution_lifecycle.py` — AVAILABLE→CLAIMED→COMPLETED, claim_id, single side effect, execution-time revalidation
+- `test_execution_revalidation.py` — task expiry between begin() and revalidate_before_execution() → cancelled state
+- `test_replay.py` — completed invocation replay blocked, stale permit fencing (attempt-1 permit rejected after attempt 2)
+- `test_audit.py` — ALLOW/DENY/REQUIRE_APPROVAL each create audit event, chain valid, fail-closed on audit failure
+- `test_concurrency.py` / `test_concurrency_advanced.py` — exactly one winner, no double execution, concurrent audit serialization
+- `test_failure_recovery.py` — CLAIMED→UNKNOWN, UNKNOWN blocks retry, reconcile while CLAIMED rejected, SIDE_EFFECT_NOT_APPLIED→AVAILABLE, SIDE_EFFECT_CONFIRMED→COMPLETED, recovery doesn't bypass authorization
+- `test_recovery_end_to_end.py` — full HTTP end-to-end: UNKNOWN→SIDE_EFFECT_NOT_APPLIED→attempt 2→COMPLETED, exactly 1 side effect
+
+### If any in-memory test fails
+
+1. Read the full traceback in the log.
+2. Classify using the table in Step 6.
+3. Do NOT modify Ruhusa. Do NOT delete or skip the test.
+4. Record the failure in the final report under "Security failures" or "Integration findings".
+5. Continue to Step 3 anyway (PostgreSQL evidence is still needed).
+
+---
+
+## Step 3 — Start PostgreSQL and run non-destructive PostgreSQL tests
+
+### 3a — Start PostgreSQL
 
 ```bash
-# Start PostgreSQL 17 service
+docker compose up -d postgres
+```
+
+Wait for readiness (up to 60 seconds):
+
+```bash
+for i in $(seq 1 60); do
+  docker compose exec -T postgres pg_isready -U postgres -d ruhusa_demo \
+    >/dev/null 2>&1 && echo "ready" && break
+  sleep 1
+done
+```
+
+If PostgreSQL does not become ready, set `RUHUSA_POSTGRES_DSN` to an existing
+external PostgreSQL 17 instance and skip the `docker compose` steps.
+If no PostgreSQL is available, skip to Step 5 (resilience/tamper require Docker).
+
+### 3b — Run non-destructive PostgreSQL tests
+
+```bash
+export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:5432/ruhusa_demo"
+
+uv run pytest tests/ \
+  -m "postgres and not destructive_postgres and not tamper" \
+  --tb=short \
+  --junitxml=".validation-results/postgres.xml" \
+  2>&1 | tee .validation-results/postgres.log
+```
+
+### What to check
+
+| Check | Expected |
+|---|---|
+| Exit code | 0 |
+| Failed tests | 0 |
+| Skipped tests | 0 |
+
+### What each postgres test covers
+
+- `test_durability.py::test_execution_invocation_audit_and_tool_state_survive_fresh_pool` — creates refund via running app, opens an independent `psycopg` pool/stores, verifies execution state, invocation record, audit event (by `audit_id`), and tool registration are all readable from a fresh connection. Proves PostgreSQL durability across independent processes.
+- `test_durability.py::test_audit_history_survives_fresh_audit_instance` — verifies a fresh `PostgresAuditLog` reads the same event and `verify_chain()` returns True.
+- `test_recovery_end_to_end.py::test_postgres_recovered_same_invocation_executes_exactly_once_on_attempt_two` — same end-to-end recovery test as in-memory lane but asserts `current_runtime.backend == "postgres"`.
+- Any concurrency or advanced tests marked `postgres`.
+
+### If a postgres test fails
+
+1. Check whether `RUHUSA_POSTGRES_DSN` is set and reachable.
+2. Check whether `ruhusa.postgres` is available: `uv run python -c "from ruhusa.postgres import PostgresExecutionStore; print('ok')"`.
+3. If the store API changed (e.g. `create_postgres_pool` signature mismatch), classify as **Ruhusa bug — API regression**.
+4. If data is not found after a fresh pool read, classify as **Ruhusa bug — durability failure**.
+5. Record and continue.
+
+---
+
+## Step 4 — Resilience: real PostgreSQL outage and container restart
+
+These tests require Docker and a writeable environment. They run with
+`RUHUSA_ALLOW_DESTRUCTIVE_TESTS=1` against an **isolated** Docker Compose project
+so they do not affect the Step 3 database.
+
+```bash
+export COMPOSE_PROJECT_NAME="ruhusa_validation_resilience"
+export RUHUSA_POSTGRES_PORT="55432"
+export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:55432/ruhusa_demo"
+export RUHUSA_ALLOW_DESTRUCTIVE_TESTS="1"
+
+docker compose down -v --remove-orphans 2>/dev/null || true
 docker compose up -d postgres
 
-# Verify it's ready
-docker compose exec postgres pg_isready -U postgres
+for i in $(seq 1 60); do
+  docker compose exec -T postgres pg_isready -U postgres -d ruhusa_demo \
+    >/dev/null 2>&1 && echo "ready" && break
+  sleep 1
+done
 
-# Set the environment variable for tests
-export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@localhost:5432/ruhusa_demo"
+uv run pytest tests/test_postgres_resilience.py \
+  -m destructive_postgres \
+  --tb=short \
+  --junitxml=".validation-results/resilience.xml" \
+  2>&1 | tee .validation-results/resilience.log
+
+docker compose down -v --remove-orphans
+unset RUHUSA_ALLOW_DESTRUCTIVE_TESTS RUHUSA_POSTGRES_PORT COMPOSE_PROJECT_NAME
 ```
 
-Then run tests with PostgreSQL:
+### What each resilience test covers
+
+- `test_database_outage_blocks_protected_side_effect_and_pool_recovers` —
+  records side-effect count, calls `docker compose stop postgres`, sends a
+  valid refund request, asserts HTTP ≥ 500 **and** side-effect count unchanged,
+  then calls `docker compose start postgres`, waits for recovery, and asserts a
+  new valid request succeeds with `execution_state == "completed"`.
+- `test_postgres_container_restart_preserves_execution_and_audit_state` —
+  creates a refund to get `invocation_id` and `audit_id`, calls
+  `docker compose restart postgres`, opens a **fresh** pool after restart, and
+  asserts execution record, audit event, and `verify_chain()` all survive.
+
+### Key invariant being verified
+
+**PostgreSQL outage must produce zero protected side effects.**
+If the side-effect count increases during an outage, that is a
+**critical Ruhusa security bug — fail-closed violated**.
+
+### If resilience tests fail
+
+- Side effect happened during outage → **CRITICAL: fail-closed invariant violated**
+- Pool did not recover after restart → may be a psycopg-pool version issue; classify as **dependency/infrastructure issue**
+- State not found after restart → **Ruhusa bug — PostgreSQL restart durability failure**
+
+---
+
+## Step 5 — Tamper evidence
+
+These tests intentionally corrupt audit data. They **must** run against a
+**separate, disposable** Docker Compose project that is destroyed afterward.
 
 ```bash
-# Run all tests (in-memory + PostgreSQL)
-uv run pytest tests/ -v
+export COMPOSE_PROJECT_NAME="ruhusa_validation_tamper"
+export RUHUSA_POSTGRES_PORT="55433"
+export RUHUSA_POSTGRES_DSN="postgresql://postgres:postgres@127.0.0.1:55433/ruhusa_demo"
+export RUHUSA_ALLOW_DESTRUCTIVE_TESTS="1"
 
-# Or just PostgreSQL tests
-uv run pytest tests/ -v -m postgres
+docker compose down -v --remove-orphans 2>/dev/null || true
+docker compose up -d postgres
+
+for i in $(seq 1 60); do
+  docker compose exec -T postgres pg_isready -U postgres -d ruhusa_demo \
+    >/dev/null 2>&1 && echo "ready" && break
+  sleep 1
+done
+
+uv run pytest tests/test_tamper.py \
+  -m tamper \
+  --tb=short \
+  --junitxml=".validation-results/tamper.xml" \
+  2>&1 | tee .validation-results/tamper.log
+
+docker compose down -v --remove-orphans
+unset RUHUSA_ALLOW_DESTRUCTIVE_TESTS RUHUSA_POSTGRES_PORT COMPOSE_PROJECT_NAME
 ```
 
-To stop PostgreSQL after testing:
+### What the tamper test covers
+
+`test_historical_audit_mutation_breaks_chain_verification`:
+1. Resets the audit table to a clean state.
+2. Creates two authorized refunds (generates ≥ 4 audit events including revalidation).
+3. Asserts `verify_chain()` returns `True`.
+4. Directly mutates `ruhusa_audit_events.reason` for `sequence = 1`.
+5. Asserts `verify_chain()` returns `False`.
+
+This proves the audit hash chain detects tampering. If `verify_chain()` returns
+`True` after mutation, that is a **critical Ruhusa security bug — tamper detection broken**.
+
+### If the tamper test fails
+
+- `verify_chain()` is True after mutation → **CRITICAL: audit tamper not detected**
+- Schema error (`ruhusa_audit_events` not found) → check `initialize_postgres_schema` ran
+- `runtime.pool` is None → app started in memory mode; ensure `RUHUSA_POSTGRES_DSN` is set before the app module is imported
+
+---
+
+## Step 6 — Classify failures
+
+For every failure, apply exactly one label:
+
+| Symptom | Classification |
+|---|---|
+| Ruhusa API changed (import error, missing method, wrong signature) | **Ruhusa bug — API regression** |
+| Security invariant violated (fail-closed, tamper, replay, duplicate side effect) | **Ruhusa bug — security invariant violated** |
+| Wrong state transition (UNKNOWN not set, permit not rejected, recovery allows retry) | **Ruhusa bug — state machine regression** |
+| `audit_id` missing from decision or re-validation result | **Ruhusa bug — audit record missing** |
+| Test uses wrong endpoint path, wrong request shape, or wrong assertion | **Smoke-app integration issue** |
+| `RUHUSA_POSTGRES_DSN` not set or unreachable host | **Environment/infrastructure issue** |
+| Docker not running, port conflict, volume permission | **Environment/infrastructure issue** |
+| Missing psycopg or psycopg-pool version | **Dependency issue** |
+| Framework behavior works but docs are wrong | **Documentation/usability issue** |
+
+**Never reclassify a security failure as an integration issue to make the suite green.**
+
+---
+
+## Step 7 — Generate the validation report
 
 ```bash
-docker compose down
+uv run python tests/report_generator.py \
+  --junit-dir .validation-results \
+  --output RUHUSA_V0_7_VALIDATION.md \
+  --ruhusa-version "$(grep 'tag = ' pyproject.toml | head -1 | grep -o 'v[0-9.]*')" \
+  --postgres-version "17"
+
+cat RUHUSA_V0_7_VALIDATION.md
 ```
 
-## Security invariants
+The report generator reads only JUnit XML files. It never re-runs tests.
+It never hardcodes PASS. It produces:
 
-The following must never be weakened:
+- **PASS** — all four mandatory lanes (in-memory, postgres, resilience, tamper) have JUnit evidence, zero failures/errors/skips
+- **PASS WITH FINDINGS** — all lanes ran, zero failures/errors, but some tests were skipped
+- **FAIL** — any lane is missing evidence, or any test failed or errored
 
-- default deny
-- fail closed
-- no unaudited ALLOW
-- canonical invocation integrity
-- immutable tool identity
-- no delegated authority expansion
-- execution-time revalidation
-- completed invocation cannot replay
-- UNKNOWN cannot automatically retry
-- only trusted reconciliation may recover UNKNOWN
-- stale execution permits cannot mutate newer attempts
-- exactly one execution winner under concurrency
-- protected side effects must not occur when authorization or trusted
-  security state is unavailable
+A FAIL caused by a missing lane (e.g. Docker unavailable) is distinct from a FAIL
+caused by a test failure. State which in the final report.
 
-## Validation workflow
+---
 
-Read:
+## Step 8 — Final report to the user
 
-`references/validation-matrix.md`
+After generating `RUHUSA_V0_7_VALIDATION.md`, report to the user:
 
-Run every applicable validation category in that matrix.
+```
+## Validation summary
 
-For PostgreSQL tests:
+Ruhusa version: <tag>
+Python: <version>
+PostgreSQL: 17
 
-- use real PostgreSQL
-- do not mock PostgreSQL stores
-- verify persistence across application restart
-- verify persistence across PostgreSQL restart
-- verify concurrent database behavior
+### Results
 
-For concurrency:
+| Lane | Tests | Passed | Failed | Skipped | Result |
+|---|---|---|---|---|---|
+| in-memory | N | N | N | N | PASS/FAIL |
+| postgres | N | N | N | N | PASS/FAIL/NOT TESTED |
+| resilience | N | N | N | N | PASS/FAIL/NOT TESTED |
+| tamper | N | N | N | N | PASS/FAIL/NOT TESTED |
 
-- use at least 20 concurrent callers
-- repeat the race multiple times
-- require exactly one winner per invocation
-- require exactly one protected side effect
+### Verdict: PASS / PASS WITH FINDINGS / FAIL
 
-For failure tests:
+### Files changed (if any)
+<list only smoke-app files changed, never Ruhusa files>
 
-- verify the side-effect counter, not only HTTP status
-- backend failure must not produce a protected side effect
+### Suspected Ruhusa bugs
+<list with classification from Step 6, or "None">
 
-For UNKNOWN recovery:
+### Smoke-app integration issues
+<list or "None">
+```
 
-- test SIDE_EFFECT_NOT_APPLIED
-- test SIDE_EFFECT_CONFIRMED
-- test invalid reconciliation while CLAIMED
-- test retry blocked while UNKNOWN
-- test stale permit fencing
-- test recovery does not bypass fresh authorization
+---
 
-For audit:
+## Security invariant reference
 
-- validate hash-chain integrity
-- validate concurrent writers
-- validate persistence
-- test tamper detection only against an isolated test database
+These invariants must never be weakened or suppressed:
 
-## Do not
+| Invariant | Verified by |
+|---|---|
+| Default deny | `test_authorization.py::test_deny_unauthorized_principal` |
+| Fail closed (no security state) | `test_audit.py::test_audit_failure_denies_operation` |
+| No unaudited ALLOW | all audit tests: every decision creates an audit event |
+| Provenance integrity | `test_provenance.py` (8 tests) |
+| Tool identity immutable | `test_provenance.py::test_untrusted_tool_id_denied`, `test_incorrect_implementation_id_denied` |
+| Execution-time revalidation | `test_execution_revalidation.py`, `test_execution_lifecycle.py::test_execution_time_revalidation_occurs` |
+| Completed replay blocked | `test_replay.py::test_replay_blocked_after_completion` |
+| Stale permit fencing | `test_replay.py::TestPermitFencing::test_stale_permit_rejected` |
+| UNKNOWN blocks automatic retry | `test_failure_recovery.py::TestUnknownBlocksAutomaticRetry` |
+| Trusted reconciliation only | `test_failure_recovery.py::TestInvalidReconciliationWhileClaimed` |
+| SIDE_EFFECT_NOT_APPLIED → attempt 2 | `test_recovery_end_to_end.py::test_recovered_same_invocation_executes_exactly_once_on_attempt_two` |
+| SIDE_EFFECT_CONFIRMED → completed | `test_failure_recovery.py::TestRecoverySideEffectConfirmed` |
+| Exactly one winner | `test_concurrency.py`, `test_concurrency_advanced.py` |
+| Fail closed on DB outage | `test_postgres_resilience.py::test_database_outage_blocks_protected_side_effect_and_pool_recovers` |
+| Audit tamper detectable | `test_tamper.py::test_historical_audit_mutation_breaks_chain_verification` |
+| Durable across fresh pool | `test_durability.py` |
 
-Do not:
+---
 
-- add FastAPI to Ruhusa
-- modify the Ruhusa repository
-- change Ruhusa security behavior
-- bypass failed tests
-- silently retry UNKNOWN operations
-- replace PostgreSQL integration tests with mocks
-- classify a test as PASS unless it actually ran
-- run destructive tamper tests against non-test data
+## What never to do
 
-## Final report
-
-Generate or update:
-
-`RUHUSA_V0_7_VALIDATION.md`
-
-Include:
-
-| Test | Security property | Backend | Result | Evidence |
-|------|-------------------|---------|--------|----------|
-
-Allowed results:
-
-- PASS
-- FAIL
-- NOT TESTED
-
-Also report:
-
-- Ruhusa version
-- Python version
-- FastAPI version
-- PostgreSQL version
-- total tests
-- passed
-- failed
-- skipped
-- PostgreSQL tests executed
-- security failures
-- integration findings
-- documentation findings
-
-At the end provide a release-validation verdict:
-
-- PASS
-- PASS WITH FINDINGS
-- FAIL
-
-A FAIL caused by a security invariant must be highlighted separately and
-must not be automatically fixed.
+- Do not modify any file in the `ruhusa` package
+- Do not mock PostgreSQL for PostgreSQL durability tests
+- Do not change a failing assertion to make it pass
+- Do not call `pytest.skip()` on a mandatory test
+- Do not generate RUHUSA_V0_7_VALIDATION.md by hand or with hardcoded values
+- Do not run tamper tests against non-disposable PostgreSQL data
+- Do not classify a security invariant failure as a documentation issue
