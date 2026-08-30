@@ -6,8 +6,6 @@ an isolated disposable PostgreSQL database.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,18 +23,23 @@ def test_historical_audit_mutation_breaks_chain_verification():
     require_destructive_opt_in()
     assert runtime.backend == "postgres"
 
-    with runtime.pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ruhusa_audit_events")
-            cur.execute(
-                """
-                UPDATE ruhusa_audit_chain
-                SET last_sequence = 0, last_hash = 'GENESIS'
-                WHERE singleton = TRUE
-                """
-            )
-
+    # Keep ALL pool operations inside the TestClient context so the pool stays
+    # open for every step.  The shutdown handler closes the pool when the
+    # 'with' block exits, so nothing must touch the pool after that point.
     with TestClient(app) as client:
+        # Step 1: reset audit table to a known-clean state
+        with runtime.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM ruhusa_audit_events")
+                cur.execute(
+                    """
+                    UPDATE ruhusa_audit_chain
+                    SET last_sequence = 0, last_hash = 'GENESIS'
+                    WHERE singleton = TRUE
+                    """
+                )
+
+        # Step 2: create two authorized refunds (≥ 4 audit events incl. revalidation)
         first = client.post(
             "/refunds",
             json={
@@ -56,18 +59,21 @@ def test_historical_audit_mutation_breaks_chain_verification():
         assert first.status_code == 200
         assert second.status_code == 200
 
-    assert runtime.audit_log.verify_chain() is True
-    assert len(runtime.audit_log.snapshot()) >= 4
+        # Step 3: chain must be valid before mutation
+        assert runtime.audit_log.verify_chain() is True
+        assert len(runtime.audit_log.snapshot()) >= 4
 
-    with runtime.pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE ruhusa_audit_events
-                SET reason = reason || ' [TAMPERED]'
-                WHERE sequence = 1
-                """
-            )
-            assert cur.rowcount == 1
+        # Step 4: directly mutate the stored reason for sequence = 1
+        with runtime.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE ruhusa_audit_events
+                    SET reason = reason || ' [TAMPERED]'
+                    WHERE sequence = 1
+                    """
+                )
+                assert cur.rowcount == 1
 
-    assert runtime.audit_log.verify_chain() is False
+        # Step 5: chain must now be broken
+        assert runtime.audit_log.verify_chain() is False

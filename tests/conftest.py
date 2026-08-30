@@ -28,7 +28,7 @@ def check_postgres_availability() -> None:
         pytest.skip(f"PostgreSQL not available: {exc}")
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def client() -> Generator[TestClient, None, None]:
     with TestClient(app) as test_client:
         yield test_client
