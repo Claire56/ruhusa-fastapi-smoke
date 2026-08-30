@@ -1,0 +1,213 @@
+name: Ruhusa v0.7.0 Validation
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  core:
+    name: Core / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ruhusa_demo
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ruhusa_demo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Run in-memory validation
+        run: |
+          mkdir -p validation-results
+          uv run pytest tests/ \
+            -m "not postgres" \
+            --tb=short \
+            --junitxml="validation-results/in-memory-py${{ matrix.python-version }}.xml"
+
+      - name: Run non-destructive PostgreSQL validation
+        env:
+          RUHUSA_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/ruhusa_demo
+        run: |
+          uv run pytest tests/ \
+            -m "postgres and not destructive_postgres and not tamper" \
+            --tb=short \
+            --junitxml="validation-results/postgres-py${{ matrix.python-version }}.xml"
+
+      - name: Upload core JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-results-py${{ matrix.python-version }}
+          path: validation-results/*.xml
+
+  resilience:
+    name: PostgreSQL outage and restart
+    runs-on: ubuntu-latest
+
+    env:
+      COMPOSE_PROJECT_NAME: ruhusa_validation_resilience
+      RUHUSA_POSTGRES_PORT: "55432"
+      RUHUSA_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:55432/ruhusa_demo
+      RUHUSA_ALLOW_DESTRUCTIVE_TESTS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - run: uv sync
+
+      - name: Start isolated PostgreSQL
+        run: |
+          docker compose up -d postgres
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres pg_isready -U postgres -d ruhusa_demo; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Run destructive resilience validation
+        run: |
+          mkdir -p validation-results
+          uv run pytest tests/test_postgres_resilience.py \
+            -m destructive_postgres \
+            --tb=short \
+            --junitxml=validation-results/resilience.xml
+
+      - name: Upload resilience evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resilience-results
+          path: validation-results/*.xml
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  tamper:
+    name: PostgreSQL audit tamper evidence
+    runs-on: ubuntu-latest
+
+    env:
+      COMPOSE_PROJECT_NAME: ruhusa_validation_tamper
+      RUHUSA_POSTGRES_PORT: "55433"
+      RUHUSA_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:55433/ruhusa_demo
+      RUHUSA_ALLOW_DESTRUCTIVE_TESTS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - run: uv sync
+
+      - name: Start isolated PostgreSQL
+        run: |
+          docker compose up -d postgres
+          for i in $(seq 1 60); do
+            if docker compose exec -T postgres pg_isready -U postgres -d ruhusa_demo; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Run tamper-evidence validation
+        run: |
+          mkdir -p validation-results
+          uv run pytest tests/test_tamper.py \
+            -m tamper \
+            --tb=short \
+            --junitxml=validation-results/tamper.xml
+
+      - name: Upload tamper evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tamper-results
+          path: validation-results/*.xml
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  report:
+    name: Validation verdict
+    needs: [core, resilience, tamper]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download JUnit evidence
+        uses: actions/download-artifact@v4
+        with:
+          path: validation-results
+          merge-multiple: true
+
+      - name: Generate evidence-based validation report
+        run: |
+          python tests/report_generator.py \
+            --junit-dir validation-results \
+            --output RUHUSA_V0_7_VALIDATION.md \
+            --ruhusa-version v0.7.0 \
+            --postgres-version 17
+          cat RUHUSA_V0_7_VALIDATION.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruhusa-v0.7.0-validation-report
+          path: RUHUSA_V0_7_VALIDATION.md

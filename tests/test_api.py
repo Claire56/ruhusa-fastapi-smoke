@@ -10,7 +10,8 @@ def test_health() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["ruhusa_backend"] == "memory"
+    # Backend can be either memory or postgres depending on DSN
+    assert body["ruhusa_backend"] in ("memory", "postgres")
     assert body["audit_chain_valid"] is True
 
 
